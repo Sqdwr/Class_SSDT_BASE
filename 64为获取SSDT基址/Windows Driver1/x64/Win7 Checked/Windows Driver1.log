@@ -1,0 +1,15 @@
+﻿Build started 2018/9/30 14:40:38.
+     1>Project "C:\Users\zhangty\Desktop\64为获取SSDT基址\Windows Driver1\Windows Driver1.vcxproj" on node 2 (Build target(s)).
+     1>ClCompile:
+         F:\VS2013\VC\bin\x86_amd64\CL.exe /c /Zi /nologo /W3 /WX- /Od /D _AMD64_ /D _DDK_ /D _WIN32_WINNT=0x0601 /D WINVER=0x0601 /D _DEBUG /D DBG=1 /Gm /MTd /GS- /fp:precise /Zc:wchar_t /Zc:forScope /Fo"x64\Win7 Checked\\" /Fd"x64\Win7 Checked\vc120.pdb" /Gz /TP /errorReport:prompt SSDT.cpp
+         SSDT.cpp
+       Link:
+         F:\VS2013\VC\bin\x86_amd64\link.exe /ERRORREPORT:PROMPT /OUT:"C:\Users\zhangty\Desktop\64为获取SSDT基址\x64\Win7 Checked\Windows Driver1.sys" /INCREMENTAL:NO /NOLOGO ntoskrnl.lib ndis.lib Hal.lib wdm.lib wdmsec.lib wmilib.lib /NODEFAULTLIB /MANIFEST:NO /DEBUG /PDB:"C:\Users\zhangty\Desktop\64为获取SSDT基址\x64\Win7 Checked\Windows Driver1.pdb" /MAP:"C:\Users\zhangty\Desktop\64为获取SSDT基址\x64\Win7 Checked\Windows Driver1.map" /SUBSYSTEM:NATIVE /Driver /TLBID:1 /ENTRY:"DriverEntry" /IMPLIB:"C:\Users\zhangty\Desktop\64为获取SSDT基址\x64\Win7 Checked\Windows Driver1.lib" /MACHINE:X64  /SECTION:INIT,D /IGNORE:4078 /safeseh:no /DLL "x64\Win7 Checked\SSDT.obj"
+         "x64\Win7 Checked\Windows Driver1.obj"
+     1>LINK : warning LNK4039: section 'INIT' specified with /SECTION option does not exist
+         Windows Driver1.vcxproj -> C:\Users\zhangty\Desktop\64为获取SSDT基址\x64\Win7 Checked\Windows Driver1.sys
+     1>Done Building Project "C:\Users\zhangty\Desktop\64为获取SSDT基址\Windows Driver1\Windows Driver1.vcxproj" (Build target(s)).
+
+Build succeeded.
+
+Time Elapsed 00:00:00.62
