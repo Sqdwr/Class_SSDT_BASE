@@ -7,10 +7,11 @@ extern "C" VOID Unload(PDRIVER_OBJECT DriverObject)
 
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegString)
 {
-	ULONG Index;
 	SSDT Ssdt;
-	for (Index = 0; Index < Ssdt.GetSSDTNumbers(); ++Index)
-		KdPrint(("第%d个函数地址是：%llx\n", Index, Ssdt.GetSSDTProcByIndex(Index)));
+
+	__debugbreak();
+
+	KdPrint(("NtOpenProcess:%llx!\n", Ssdt.GetSSDTProcByName("NtOpenProcess")));
 
 	DriverObject->DriverUnload = Unload;
 	return STATUS_SUCCESS;

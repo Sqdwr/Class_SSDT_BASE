@@ -1,54 +1,176 @@
 #include "SSDT.h"
 
+extern "C" PVOID GetProcAddress(WCHAR *ProcName)
+{
+	UNICODE_STRING Temp = { 0 };
+
+	if (ProcName == NULL)
+		return NULL;
+
+	RtlInitUnicodeString(&Temp, ProcName);
+	return MmGetSystemRoutineAddress(&Temp);
+}
+
 SSDT::SSDT()
 {
-	NtdllImageBase = NULL;
 	ServiceTableBase = NULL;
 	ShadowServiceTableBase = NULL;
+
+	NtoskrnlBase = NULL;
+	NtoskrnlSize = 0;
+
+	NtdllImageBase = NULL;
+	ExportDirectory = NULL;
+	ExportOrdinalsArry = NULL;
+	ExportNameArry = NULL;
+	ExportAddressArry = NULL;
+
+	__debugbreak();
+
+	GetKernelBase();
+	FindSSDT();
+	LoadNtdll();
 }
 
 SSDT::~SSDT()
 {
-	if (NtdllImageBase != NULL)
-		ExFreePoolWithTag(NtdllImageBase, 'ytz');
+	ServiceTableBase = NULL;
+	ShadowServiceTableBase = NULL;
+
+	NtoskrnlBase = NULL;
+	NtoskrnlSize = 0;
+
+	sfFreeMemory(NtdllImageBase);
+	NtdllImageBase = NULL;
+	ExportDirectory = NULL;
+	ExportOrdinalsArry = NULL;
+	ExportNameArry = NULL;
+	ExportAddressArry = NULL;
 }
 
-BOOLEAN SSDT::FindSSDT()
+VOID SSDT::GetKernelBase()
 {
-	ULONG_PTR SystemCall64;								//从msr中读取到的SystemCall64的地址
-	ULONG_PTR StartAddress;								//搜寻的起始地址就是SystemCall64的起始地址
-	ULONG_PTR EndAddress;								//搜寻的终结地址
-	UCHAR *p;											//用来判断的特征码
+	ULONG Length = 0;
+	PSYSTEM_MODULE_INFORMATION ModuleInfo = NULL;
+	ZWQUERYSYSTEMINFORMATION ZwQuerySystemInformation = NULL;
 
-	SystemCall64 = __readmsr(0xC0000082);
-	StartAddress = SystemCall64;
-	EndAddress = StartAddress + 0x500;
-	while (StartAddress < EndAddress)
+	ULONG Index = 0;
+	
+	PVOID Addr_NtOpenFile = NULL;
+
+	NTSTATUS Status = STATUS_UNSUCCESSFUL;
+
+	do
 	{
-		p = (UCHAR*)StartAddress;
-		if (MmIsAddressValid(p) && MmIsAddressValid(p + 1) && MmIsAddressValid(p + 2))
+		ZwQuerySystemInformation = (ZWQUERYSYSTEMINFORMATION)GetProcAddress(L"ZwQuerySystemInformation");
+		if (ZwQuerySystemInformation == NULL)
 		{
-			if (*p == 0x4c && *(p + 1) == 0x8d && *(p + 2) == 0x15)
+			KdPrint(("[%s][%s] Get ZwQuerySystemInformation Fail!\n", SSDT_PRINT, __FUNCTION__));
+			break;
+		}
+
+		Addr_NtOpenFile = GetProcAddress(L"NtOpenFile");
+		if (Addr_NtOpenFile == NULL)
+		{
+			KdPrint(("[%s][%s] Get NtOpenFile Fail!\n", SSDT_PRINT, __FUNCTION__));
+			break;
+		}
+
+		Status = ZwQuerySystemInformation(SystemModuleInformation, NULL, 0, &Length);
+		if (Status != STATUS_INFO_LENGTH_MISMATCH)
+		{
+			KdPrint(("[%s][%s] ZwQuerySystemInformation Fail!Status:%x!\n", SSDT_PRINT, __FUNCTION__, Status));
+			break;
+		}
+		Length = Length * 2;
+
+		ModuleInfo = (PSYSTEM_MODULE_INFORMATION)sfAllocateMemory(Length);
+		if (ModuleInfo == NULL)
+		{
+			KdPrint(("[%s][%s] Allocate %d Bytes Fail!\n", SSDT_PRINT, __FUNCTION__, Length));
+			break;
+		}
+		RtlZeroMemory(ModuleInfo, Length);
+
+		Status = ZwQuerySystemInformation(SystemModuleInformation, ModuleInfo, Length, &Length);
+		if (!NT_SUCCESS(Status))
+		{
+			KdPrint(("[%s][%s] ZwQuerySystemInformation Fail!Status:%x!\n", SSDT_PRINT, __FUNCTION__, Status));
+			break;
+		}
+
+		for (Index = 0; Index < ModuleInfo->ModuleNumber; ++Index)
+		{
+			if (ModuleInfo->ModuleEntry[Index].Base <= (ULONG_PTR)Addr_NtOpenFile &&
+				(ULONG_PTR)Addr_NtOpenFile <= ModuleInfo->ModuleEntry[Index].Base + ModuleInfo->ModuleEntry[Index].Size)
 			{
-				ServiceTableBase = (PSYSTEM_SERVICE_TABLE)(*(ULONG*)(p + 3) + (ULONG_PTR)(p + 7));
-				ShadowServiceTableBase = (PSYSTEM_SERVICE_TABLE)(*(ULONG*)(p + 10) + (ULONG_PTR)(p + 14));
+				NtoskrnlBase = (PVOID)ModuleInfo->ModuleEntry[Index].Base;
+				NtoskrnlSize = ModuleInfo->ModuleEntry[Index].Size;
 				break;
 			}
 		}
-		++StartAddress;
-	}
 
-	if (ServiceTableBase == NULL)
-	{
-		KdPrint(("ServiceTableBase初始化失败！\n"));
-		return FALSE;
-	}
+	} while (FALSE);
 
-	KdPrint(("ServiceTableBase初始化成功！\n"));
-	return TRUE;
+	sfFreeMemory(ModuleInfo);
 }
 
-BOOLEAN SSDT::LoadNtdll()
+VOID SSDT::FindSSDT()
+{
+	PIMAGE_NT_HEADERS NtHeader = NULL;
+	PIMAGE_SECTION_HEADER SectionHeader = NULL;
+
+	PUCHAR StartSearchAddress = NULL;
+	PUCHAR EndSearchAddress = NULL;
+
+	UCHAR FisrtOpCode[] = "\x4c\x8d\x15";
+	UCHAR SecondOpCode[] = "\x4c\x8d\x1d";
+
+	do
+	{
+		if (NtoskrnlBase == NULL)
+		{
+			KdPrint(("[%s][%s] NtoskrnlBase is NULL!\n", SSDT_PRINT, __FUNCTION__));
+			break;
+		}
+
+		NtHeader = RtlImageNtHeader(NtoskrnlBase);
+		if (NtHeader == NULL)
+		{
+			KdPrint(("[%s][%s] Get NnHeaders Fail!\n", SSDT_PRINT, __FUNCTION__));
+			break;
+		}
+
+		SectionHeader = IMAGE_FIRST_SECTION(NtHeader);
+		for (USHORT i = 0; i < NtHeader->FileHeader.NumberOfSections; ++i, ++SectionHeader)
+		{
+			if (SectionHeader->Characteristics & IMAGE_SCN_MEM_NOT_PAGED &&
+				SectionHeader->Characteristics & IMAGE_SCN_MEM_EXECUTE &&
+				!(SectionHeader->Characteristics & IMAGE_SCN_MEM_DISCARDABLE) &&
+				(*(PULONG)SectionHeader->Name != 'TINI') &&
+				(*(PULONG)SectionHeader->Name != 'EGAP'))
+			{
+				StartSearchAddress = (PUCHAR)NtoskrnlBase + SectionHeader->VirtualAddress;
+				EndSearchAddress = (PUCHAR)StartSearchAddress + SectionHeader->Misc.VirtualSize - 10;
+
+				while (StartSearchAddress < EndSearchAddress)
+				{
+					if (RtlCompareMemory(StartSearchAddress, FisrtOpCode, sizeof(FisrtOpCode) - 1) == sizeof(FisrtOpCode) - 1 &&
+						RtlCompareMemory(StartSearchAddress + 7, SecondOpCode, sizeof(SecondOpCode) - 1) == sizeof(SecondOpCode) - 1)
+					{
+						ServiceTableBase = (PSYSTEM_SERVICE_TABLE)((PUCHAR)StartSearchAddress + 7 + *(PULONG)((PUCHAR)StartSearchAddress + 3));
+						break;
+					}
+
+					++StartSearchAddress;
+				}
+			}
+		}
+
+	} while (FALSE);
+}
+
+VOID SSDT::LoadNtdll()
 {
 	WCHAR NtdllPath[] = L"\\SystemRoot\\system32\\ntdll.dll";
 	UNICODE_STRING FilePath = { 0 };
@@ -60,176 +182,152 @@ BOOLEAN SSDT::LoadNtdll()
 	LARGE_INTEGER ReadBytes = { 0 };
 	FILE_STANDARD_INFORMATION FileInformation = { 0 };
 
-	IMAGE_DOS_HEADER *DosHeader = NULL;
 	IMAGE_NT_HEADERS *NtHeader = NULL;
 	IMAGE_SECTION_HEADER * SectionHeader = NULL;
-	IMAGE_BASE_RELOCATION * RelocationBase = NULL;
 
 	NTSTATUS Status = STATUS_UNSUCCESSFUL;
 
-	RtlInitUnicodeString(&FilePath, NtdllPath);
-	InitializeObjectAttributes(&FileAttributes, &FilePath, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-	Status = ZwCreateFile(&FileHandle,
-		GENERIC_READ | SYNCHRONIZE,
-		&FileAttributes,
-		&IoBlock,
-		NULL,
-		FILE_ATTRIBUTE_NORMAL,
-		FILE_SHARE_READ,
-		FILE_OPEN,
-		FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-		NULL,
-		0);
-
-	if (!NT_SUCCESS(Status))
+	do
 	{
-		KdPrint(("打开文件失败！错误码是：%x\n", Status));
-		return FALSE;
-	}
+		RtlInitUnicodeString(&FilePath, NtdllPath);
+		InitializeObjectAttributes(&FileAttributes, &FilePath, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-	Status = ZwQueryInformationFile(FileHandle,
-		&IoBlock,
-		&FileInformation,
-		sizeof(FILE_STANDARD_INFORMATION),
-		FileStandardInformation);
+		Status = ZwCreateFile(&FileHandle,
+			GENERIC_READ | SYNCHRONIZE,
+			&FileAttributes,
+			&IoBlock,
+			NULL,
+			FILE_ATTRIBUTE_NORMAL,
+			FILE_SHARE_READ,
+			FILE_OPEN,
+			FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+			NULL,
+			0);
 
-	if (!NT_SUCCESS(Status))
+		if (!NT_SUCCESS(Status))
+		{
+			KdPrint(("[%s][%s] ZwCreateFile Fail!Status:%x!\n", SSDT_PRINT, __FUNCTION__, Status));
+			break;
+		}
+
+		Status = ZwQueryInformationFile(FileHandle,
+			&IoBlock,
+			&FileInformation,
+			sizeof(FILE_STANDARD_INFORMATION),
+			FileStandardInformation);
+
+		if (!NT_SUCCESS(Status))
+		{
+			KdPrint(("[%s][%s] ZwQueryInformationFile Fail!Status:%x!\n", SSDT_PRINT, __FUNCTION__, Status));
+			break;
+		}
+
+		if (FileInformation.EndOfFile.HighPart != 0 || FileInformation.EndOfFile.LowPart < sizeof(IMAGE_DOS_HEADER))
+		{
+			KdPrint(("[%s][%s] FileSize:%lld Bytes!\n", SSDT_PRINT, __FUNCTION__, FileInformation.EndOfFile.QuadPart));
+			break;
+		}
+
+		FileContent = (CHAR *)sfAllocateMemory(FileInformation.EndOfFile.LowPart);
+		if (FileContent == NULL)
+		{
+			KdPrint(("[%s][%s] Allocate FileContent Fail!\n", SSDT_PRINT, __FUNCTION__));
+			break;
+		}
+		RtlZeroMemory(FileContent, FileInformation.EndOfFile.LowPart);
+
+		Status = ZwReadFile(FileHandle, NULL, NULL, NULL, &IoBlock, (PVOID)FileContent, FileInformation.EndOfFile.LowPart, &ReadBytes, NULL);
+		if (!NT_SUCCESS(Status))
+		{
+			KdPrint(("[%s][%s] ZwReadFile Fail!Status:%x!\n", SSDT_PRINT, __FUNCTION__, Status));
+			break;
+		}
+
+		NtHeader = RtlImageNtHeader(FileContent);
+		if (NtHeader == NULL)
+		{
+			KdPrint(("[%s][%s] Get NtHeaders Fail!\n", SSDT_PRINT, __FUNCTION__));
+			break;
+		}
+
+		NtdllImageBase = (CHAR *)sfAllocateMemory(NtHeader->OptionalHeader.SizeOfImage);
+		if (NtdllImageBase == NULL)
+		{
+			KdPrint(("[%s][%s] Allocate NtdllImageBase Fail!\n", SSDT_PRINT, __FUNCTION__));
+			break;
+		}
+
+		RtlZeroMemory(NtdllImageBase, NtHeader->OptionalHeader.SizeOfImage);
+		RtlCopyMemory(NtdllImageBase, FileContent, NtHeader->OptionalHeader.SizeOfHeaders);
+
+		SectionHeader = IMAGE_FIRST_SECTION(NtHeader);
+		for (USHORT i = 0; i < NtHeader->FileHeader.NumberOfSections; ++i, ++SectionHeader)
+			RtlCopyMemory(NtdllImageBase + SectionHeader->VirtualAddress, FileContent + SectionHeader->PointerToRawData, SectionHeader->SizeOfRawData);
+
+		if (NtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size == 0)
+		{
+			KdPrint(("[%s][%s] ExportDirectory Size is 0!\n", SSDT_PRINT, __FUNCTION__));
+			break;
+		}
+
+		ExportDirectory = (IMAGE_EXPORT_DIRECTORY *)(NtdllImageBase + NtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+		
+		ExportOrdinalsArry = (USHORT *)(NtdllImageBase + ExportDirectory->AddressOfNameOrdinals);
+		ExportNameArry = (ULONG *)(NtdllImageBase + ExportDirectory->AddressOfNames);
+		ExportAddressArry = (ULONG *)(NtdllImageBase + ExportDirectory->AddressOfFunctions);
+
+	} while (FALSE);
+
+	sfFreeMemory(FileContent);
+
+	if (FileHandle != NULL)
 	{
 		ZwClose(FileHandle);
-
-		KdPrint(("获取文件信息失败！错误码是：%x\n", Status));
-		return FALSE;
+		FileHandle = NULL;
 	}
-
-	if (FileInformation.EndOfFile.HighPart != 0 || FileInformation.EndOfFile.LowPart < sizeof(IMAGE_DOS_HEADER))
-	{
-		ZwClose(FileHandle);
-
-		KdPrint(("文件大小不正确！"));
-		return FALSE;
-	}
-
-	FileContent = (CHAR*)sfExAllocateMemory(FileInformation.EndOfFile.LowPart);
-	if (FileContent == NULL)
-	{
-		ZwClose(FileHandle);
-
-		KdPrint(("分配内存%d字节失败！", FileInformation.EndOfFile.LowPart));
-		return FALSE;
-	}
-
-	Status = ZwReadFile(FileHandle, NULL, NULL, NULL, &IoBlock, (PVOID)FileContent, FileInformation.EndOfFile.LowPart, &ReadBytes, NULL);
-	if (!NT_SUCCESS(Status))
-	{
-		ZwClose(FileHandle);
-		sfFreeMemory(FileContent);
-
-		KdPrint(("读取文件失败！错误码是：%x\n", Status));
-		return FALSE;
-	}
-
-	DosHeader = (IMAGE_DOS_HEADER *)FileContent;
-	if (DosHeader->e_magic != IMAGE_DOS_SIGNATURE)
-	{
-		ZwClose(FileHandle);
-		sfFreeMemory(FileContent);
-
-		KdPrint(("该文件不是PE文件！\n"));
-		return FALSE;
-	}
-
-	NtHeader = (IMAGE_NT_HEADERS *)(FileContent + DosHeader->e_lfanew);
-	if (NtHeader->Signature != IMAGE_NT_SIGNATURE)
-	{
-		ZwClose(FileHandle);
-		sfFreeMemory(FileContent);
-
-		KdPrint(("该文件不是PE文件！\n"));
-		return FALSE;
-	}
-
-	NtdllImageBase = (CHAR *)sfExAllocateMemory(NtHeader->OptionalHeader.SizeOfImage);
-	if (NtdllImageBase == NULL)
-	{
-		ZwClose(FileHandle);
-		sfFreeMemory(FileContent);
-
-		KdPrint(("分配内存%d字节失败！", NtHeader->OptionalHeader.SizeOfImage));
-		return FALSE;
-	}
-
-	RtlZeroMemory(NtdllImageBase, NtHeader->OptionalHeader.SizeOfImage);
-	RtlCopyMemory(NtdllImageBase, FileContent, NtHeader->OptionalHeader.SizeOfHeaders);
-
-	SectionHeader = IMAGE_FIRST_SECTION(NtHeader);
-	for (USHORT i = 0; i < NtHeader->FileHeader.NumberOfSections; ++i, ++SectionHeader)
-		RtlCopyMemory(NtdllImageBase + SectionHeader->VirtualAddress, FileContent + SectionHeader->PointerToRawData, SectionHeader->SizeOfRawData);
-
-	return TRUE;
 }
 
 ULONG SSDT::GetProcIndex(CHAR * ProcName)
 {
-	IMAGE_DOS_HEADER *DosHeader = NULL;
-	IMAGE_NT_HEADERS *NtHeader = NULL;
-	IMAGE_EXPORT_DIRECTORY *ExportDirectory = NULL;
-
 	USHORT i = 0;
-	USHORT *ExportOrdinalsArry = NULL;
-	ULONG* ExportNameArry = NULL;
-	ULONG *ExportAddressArry = NULL;
 
-	ULONG FuncIndex = 0;
+	ULONG FuncIndex = (ULONG)-1;
 	CHAR *LocalProcName = NULL;
 
-	LocalProcName = (CHAR *)sfExAllocateMemory(strlen(ProcName) + 1);
-	if (LocalProcName == NULL)
+	do
 	{
-		KdPrint(("分配保存字符串的内存失败！\n"));
-		return FuncIndex;
-	}
-
-	RtlZeroMemory(LocalProcName, strlen(ProcName) + 1);
-	RtlCopyMemory(LocalProcName, ProcName, strlen(ProcName));
-	LocalProcName[0] = 'N';
-	LocalProcName[1] = 't';
-
-	if (NtdllImageBase == NULL)
-	{
-		sfFreeMemory(LocalProcName);
-
-		KdPrint(("NtdllImage没有初始化！\n"));
-		return FuncIndex;
-	}
-
-	DosHeader = (IMAGE_DOS_HEADER *)NtdllImageBase;
-	NtHeader = (IMAGE_NT_HEADERS *)(NtdllImageBase + DosHeader->e_lfanew);
-
-	if (NtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size == 0)
-	{
-		sfFreeMemory(LocalProcName);
-
-		KdPrint(("导出表为空！\n"));
-		return FuncIndex;
-	}
-
-	ExportDirectory = (IMAGE_EXPORT_DIRECTORY *)(NtdllImageBase + NtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
-	ExportOrdinalsArry = (USHORT *)(NtdllImageBase + ExportDirectory->AddressOfNameOrdinals);
-	ExportNameArry = (ULONG *)(NtdllImageBase + ExportDirectory->AddressOfNames);
-	ExportAddressArry = (ULONG *)(NtdllImageBase + ExportDirectory->AddressOfFunctions);
-
-	for (i = 0; i < ExportDirectory->NumberOfFunctions; ++i)
-	{
-		if (strcmp(LocalProcName, (CHAR *)(NtdllImageBase + ExportNameArry[i])) == 0)
+		if (NtdllImageBase == NULL || ExportDirectory == NULL || ExportOrdinalsArry == NULL || ExportNameArry == NULL || ExportAddressArry == NULL)
 		{
-			FuncIndex = *(ULONG *)(NtdllImageBase + ExportAddressArry[ExportOrdinalsArry[i]] + 4);
-			KdPrint(("%s的编号是：%d\n", ProcName, FuncIndex));
+			KdPrint(("[%s][%s] NtImageBase is NULL!\n", SSDT_PRINT, __FUNCTION__));
 			break;
 		}
-	}
 
-	sfFreeMemory(LocalProcName);
+		LocalProcName = (CHAR *)sfAllocateMemory(strlen(ProcName) + 1);
+		if (LocalProcName == NULL)
+		{
+			KdPrint(("[%s][%s] Allocate LocalProcName Fail!\n", SSDT_PRINT, __FUNCTION__));
+			break;
+		}
+		RtlZeroMemory(LocalProcName, strlen(ProcName) + 1);
+		RtlCopyMemory(LocalProcName, ProcName, strlen(ProcName));
+
+		LocalProcName[0] = 'N';
+		LocalProcName[1] = 't';
+
+		for (i = 0; i < ExportDirectory->NumberOfFunctions; ++i)
+		{
+			if (_stricmp(LocalProcName, (CHAR *)(NtdllImageBase + ExportNameArry[i])) == 0)
+			{
+				FuncIndex = *(ULONG *)(NtdllImageBase + ExportAddressArry[ExportOrdinalsArry[i]] + 4);
+				KdPrint(("[%s][%s] %s Index:%d!\n", SSDT_PRINT, __FUNCTION__, ProcName, FuncIndex));
+				break;
+			}
+		}
+
+	} while (FALSE);
+
+	RtlZeroMemory(LocalProcName, strlen(ProcName) + 1);
+
 	return FuncIndex;
 }
 
@@ -237,13 +335,24 @@ ULONG_PTR SSDT::GetSSDTProcByIndex(ULONG Index)
 {
 	ULONG_PTR FuncAddress = 0;
 	
-	if (ServiceTableBase == NULL)
+	do
 	{
-		KdPrint(("ServiceTableBase初始化失败！\n"));
-		return 0;
-	}
+		if (ServiceTableBase == NULL)
+		{
+			KdPrint(("[%s][%s] ServiceTableBase is NULL!\n", SSDT_PRINT, __FUNCTION__));
+			break;
+		}
 
-	FuncAddress = (ULONG_PTR)(ServiceTableBase->ServiceTableBase[Index] >> 4) + (ULONG_PTR)ServiceTableBase->ServiceTableBase;
+		if (Index == -1 || Index > ServiceTableBase->NumberOfServices)
+		{
+			KdPrint(("[%s][%s] Invalid Index:%d!\n", SSDT_PRINT, __FUNCTION__, Index));
+			break;
+		}
+
+		FuncAddress = (ULONG_PTR)(ServiceTableBase->ServiceTableBase[Index] >> 4) + (ULONG_PTR)ServiceTableBase->ServiceTableBase;
+
+	} while (FALSE);
+
 	return FuncAddress;
 }
 
@@ -251,12 +360,23 @@ ULONG_PTR SSDT::GetSSDTProcByName(CHAR * ProcName)
 {
 	ULONG FuncIndex = 0;
 
-	FuncIndex = GetProcIndex(ProcName);
-	if (FuncIndex == 0)
+	do
 	{
-		KdPrint(("没找到函数%s！\n", ProcName));
-		return 0;
-	}
+		if (ServiceTableBase == NULL)
+		{
+			KdPrint(("[%s][%s] ServiceTableBase is NULL!\n", SSDT_PRINT, __FUNCTION__));
+			break;
+		}
+
+		if (ProcName == NULL)
+		{
+			KdPrint(("[%s][%s] Invalid ProcName!\n", SSDT_PRINT, __FUNCTION__));
+			break;
+		}
+
+		FuncIndex = GetProcIndex(ProcName);
+
+	} while (FALSE);
 
 	return GetSSDTProcByIndex(FuncIndex);
 }
@@ -265,7 +385,7 @@ ULONG_PTR SSDT::GetSSDTNumbers()
 {
 	if (ServiceTableBase == NULL)
 	{
-		KdPrint(("ServiceTableBase初始化失败！\n"));
+		KdPrint(("[%s][%s] ServiceTableBase is NULL!\n", SSDT_PRINT, __FUNCTION__));
 		return 0;
 	}
 
